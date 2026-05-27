@@ -504,17 +504,14 @@ class ZEMGuidance:
         if is_boot:
             return accel_cmd
 
-        # 估计剩余飞行时间
-        if v_closing > 2.0:
-            t_go = distance / v_closing
-        else:
-            t_go = distance / max(interceptor_state.speed(), 1.0)
-
-        t_go = np.clip(t_go, 0.5, 20.0)
+        # 估计剩余飞行时间（改进版）
+        relative_accel_mag = np.linalg.norm(self._target_accel_estimate - interceptor_state.acceleration)
+        t_go = self._estimate_time_to_go(distance, v_closing, relative_accel_mag, interceptor_state.speed())
 
         # 计算零脱靶量 (ZEM)
         # 如果双方都不加速，最终会偏多远？
-        relative_accel = self._target_accel_estimate  # 拦截机加速度为0（假设）
+        # 正确的相对加速度 = 目标加速度 - 拦截机加速度
+        relative_accel = self._target_accel_estimate - interceptor_state.acceleration
         zem = (relative_pos +
                relative_vel * t_go +
                0.5 * relative_accel * t_go ** 2)
@@ -536,7 +533,8 @@ class ZEMGuidance:
                 omega = np.cross(relative_pos, relative_vel) / (distance ** 2)
                 # 将角速度转换为线加速度方向
                 los_rate_correction = np.cross(omega, los_unit) * v_closing
-                pn_gain = 2.0 * (1.0 - distance / 150.0)  # 距离越近PN项越大
+                # 改进：使用更平滑的距离衰减
+                pn_gain = 2.0 * ((150.0 - distance) / 150.0) ** 2  # 二次衰减更平滑
                 accel_cmd += pn_gain * los_rate_correction
 
         # 远离修正
@@ -544,6 +542,29 @@ class ZEMGuidance:
             accel_cmd += los_unit * abs(v_closing) * 0.3
 
         return accel_cmd
+
+    def _estimate_time_to_go(self, distance, v_closing, relative_accel_mag, interceptor_speed):
+        """改进的 t_go 估计，考虑加速度影响"""
+        # 基础估计
+        if v_closing > 2.0:
+            t_go = distance / v_closing
+        else:
+            t_go = distance / max(interceptor_speed, 1.0)
+
+        # 一阶修正：考虑相对加速度的影响
+        # d = v_closing * t_go + 0.5 * a_rel * t_go^2
+        # 使用牛顿法迭代求解
+        a_rel_along_los = relative_accel_mag  # 沿视线方向的相对加速度分量
+        for _ in range(3):  # 3次迭代足够收敛
+            if v_closing > 0.1:
+                # t_go = (-v_closing + sqrt(v_closing^2 + 2*a_rel*d)) / a_rel
+                discriminant = v_closing**2 + 2 * abs(a_rel_along_los) * distance
+                if discriminant > 0:
+                    t_go_new = (-v_closing + np.sqrt(discriminant)) / max(abs(a_rel_along_los), 0.1)
+                    if t_go_new > 0.1:
+                        t_go = 0.7 * t_go + 0.3 * t_go_new  # 加权混合
+
+        return np.clip(t_go, 0.5, 20.0)
 
     def reset(self):
         self._bootstrap_steps = 0.0

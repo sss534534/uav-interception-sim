@@ -1,8 +1,12 @@
 """
-无人机拦截仿真系统 - 仿真引擎
-UAV Interception Simulation - Simulation Engine
+无人机拦截仿真系统 - 仿真引擎（升级版）
+UAV Interception Simulation - Simulation Engine (Upgraded)
 
-核心仿真循环，管理无人机状态更新和拦截判定
+升级内容:
+- 同步更新：先计算所有指令，再同步更新双方状态（消除一拍延迟）
+- 能量/载荷因子记录
+- 电量耗尽判定
+- 兼容新动力学模型（气动/能量/执行器延迟）
 """
 
 import numpy as np
@@ -57,6 +61,10 @@ class SimulationRecord:
     target_velocities: List[np.ndarray] = field(default_factory=list)
     distances: List[float] = field(default_factory=list)
     closing_speeds: List[float] = field(default_factory=list)
+    # 升级新增
+    interceptor_load_factors: List[float] = field(default_factory=list)
+    interceptor_battery: List[float] = field(default_factory=list)
+    target_battery: List[float] = field(default_factory=list)
 
     def add_record(self, t: float, i_state: DroneState, t_state: DroneState):
         self.times.append(t)
@@ -77,9 +85,14 @@ class SimulationRecord:
             v_closing = 0.0
         self.closing_speeds.append(v_closing)
 
+        # 升级：记录载荷因子和电量
+        self.interceptor_load_factors.append(i_state.load_factor)
+        self.interceptor_battery.append(i_state.battery_remaining)
+        self.target_battery.append(t_state.battery_remaining)
+
     def to_arrays(self):
         """转换为numpy数组便于分析"""
-        return {
+        result = {
             'times': np.array(self.times),
             'interceptor_pos': np.array(self.interceptor_positions),
             'interceptor_vel': np.array(self.interceptor_velocities),
@@ -89,6 +102,11 @@ class SimulationRecord:
             'distances': np.array(self.distances),
             'closing_speeds': np.array(self.closing_speeds),
         }
+        if self.interceptor_load_factors:
+            result['interceptor_load_factors'] = np.array(self.interceptor_load_factors)
+            result['interceptor_battery'] = np.array(self.interceptor_battery)
+            result['target_battery'] = np.array(self.target_battery)
+        return result
 
 
 class SimulationEngine:
@@ -151,7 +169,7 @@ class SimulationEngine:
 
     def step(self) -> bool:
         """
-        执行一步仿真
+        执行一步仿真（升级版：同步更新，消除一拍延迟）
 
         返回:
             True 如果仿真继续, False 如果仿真结束
@@ -163,30 +181,29 @@ class SimulationEngine:
         i_state = self.interceptor_state
         t_state = self.target_state
 
-        # 1. 目标机更新（使用逃脱策略或原生策略）
+        # ── 同步计算所有指令（消除一拍延迟） ──
+        # 1a. 目标机计算加速度指令
         if hasattr(self, 'evasion') and self.evasion is not None:
-            # 使用逃脱策略
             threat = self.evasion.assess_threat(t_state, i_state)
             target_accel = self.evasion.compute_acceleration(t_state, i_state, threat, dt)
         else:
-            # 使用原生目标策略
             target_accel = self.target_strategy.get_acceleration(t_state, self.target_params)
-        self.target_state = self.target_dynamics.update(t_state, target_accel, dt)
 
-        # 2. 拦截机计算制导指令
+        # 1b. 拦截机计算制导指令（使用同一时刻的状态）
         interceptor_accel = self.guidance.compute_acceleration(i_state, t_state, dt)
 
-        # 3. 拦截机更新
+        # ── 同步更新双方状态 ──
+        self.target_state = self.target_dynamics.update(t_state, target_accel, dt)
         self.interceptor_state = self.interceptor_dynamics.update(i_state, interceptor_accel, dt)
 
-        # 4. 记录数据
+        # ── 记录数据 ──
         self.record.add_record(
             self.interceptor_state.time,
             self.interceptor_state,
             self.target_state
         )
 
-        # 5. 拦截判定
+        # ── 拦截判定 ──
         distance = np.linalg.norm(self.target_state.position - self.interceptor_state.position)
 
         if distance <= self.config.intercept_radius:
@@ -197,7 +214,16 @@ class SimulationEngine:
             self.finished = True
             return False
 
-        # 6. 超时/丢失判定
+        # ── 电量耗尽判定 ──
+        if (self.interceptor_state.battery_remaining <= 0 or
+                self.target_state.battery_remaining <= 0):
+            self.result.intercepted = False
+            self.result.miss_distance = distance
+            self.result.total_time = self.interceptor_state.time
+            self.finished = True
+            return False
+
+        # ── 超时/丢失判定 ──
         if self.interceptor_state.time >= self.config.max_time:
             self.result.intercepted = False
             self.result.miss_distance = distance
@@ -205,7 +231,7 @@ class SimulationEngine:
             self.finished = True
             return False
 
-        # 7. 目标飞出范围判定
+        # ── 目标飞出范围判定 ──
         if np.linalg.norm(self.target_state.position) > 5000:
             self.result.intercepted = False
             self.result.miss_distance = distance
